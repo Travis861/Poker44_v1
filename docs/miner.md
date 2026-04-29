@@ -162,10 +162,24 @@ Before using the script, set at least:
 - `WALLET_NAME`
 - `HOTKEY`
 - `AXON_PORT`
-- `ALLOWED_VALIDATOR_HOTKEYS` for the recommended allowlist mode
+- `ALLOWED_VALIDATOR_HOTKEYS` for the recommended allowlist mode, or use the
+  script's bundled production allowlist.
 
 If `ALLOWED_VALIDATOR_HOTKEYS` is empty, the script falls back to
-`--blacklist.force_validator_permit`.
+the bundled production validator allowlist. To disable that behavior, edit
+`scripts/miner/run/run_miner.sh` and remove the default allowlist block.
+
+If you are not receiving validator queries, check these first:
+
+- the miner process is actually running from `miner_env`, not the system Python;
+- `models/poker44_xgb_calibrated.joblib` exists or `POKER44_MODEL_PATH` points
+  to a readable model artifact;
+- your hotkey is registered on subnet `126`;
+- your axon has a non-zero serving IP and port in the metagraph;
+- your firewall/router allows inbound traffic to `AXON_PORT`;
+- PM2 logs show `Serving miner axon` and do not show dependency/model-load
+  errors;
+- the validator allowlist contains current production validator hotkeys.
 
 Direct CLI example:
 

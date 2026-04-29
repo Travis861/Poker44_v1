@@ -1,15 +1,22 @@
 #!/bin/bash
 
 # Poker44 Miner Startup Script
+set -euo pipefail
 
 NETUID="${NETUID:-126}"
-WALLET_NAME="${WALLET_NAME:-poker44-miner-ck}"
-HOTKEY="${HOTKEY:-poker44-miner-hk}"
+WALLET_NAME="${WALLET_NAME:-}"
+HOTKEY="${HOTKEY:-}"
 NETWORK="${NETWORK:-finney}"
+CHAIN_ENDPOINT="${CHAIN_ENDPOINT:-}"
 MINER_SCRIPT="${MINER_SCRIPT:-./neurons/miner.py}"
 PM2_NAME="${PM2_NAME:-poker44_miner}"  ##  name of Miner, as you wish
 AXON_PORT="${AXON_PORT:-8091}"
 ALLOWED_VALIDATOR_HOTKEYS="${ALLOWED_VALIDATOR_HOTKEYS:-}"
+MODEL_PATH="${POKER44_MODEL_PATH:-models/poker44_xgb_calibrated.joblib}"
+
+if [ -z "$ALLOWED_VALIDATOR_HOTKEYS" ]; then
+  ALLOWED_VALIDATOR_HOTKEYS="5EP9fmtknrTnDhQmLRY9ciFYoM7YZM8rPWvQ9J7yywEsn126 5FZD47WhA1UaVicYAr7pGnWb2YQLMD7uViipDYN2r1AJ5ggD 5FxQcdsCXcNjWowQ63Y2oeMhN3JRQksejV3aHRr4XmtknM2k 5HmkWGB5PVzKCNLB4QxWWHFVEHPAbKKxGyoXW7Evs38gs126 5C8R8ifnxswxhSsRiRhkriRAThdryCpkP6ScZXUotJhsuNZD"
+fi
 
 if [ ! -f "$MINER_SCRIPT" ]; then
     echo "Error: Miner script not found at $MINER_SCRIPT"
@@ -20,6 +27,41 @@ if ! command -v pm2 &> /dev/null; then
     echo "Error: PM2 is not installed"
     exit 1
 fi
+
+if [ -z "$WALLET_NAME" ]; then
+    echo "Error: WALLET_NAME must be set before starting the miner"
+    exit 1
+fi
+
+if [ -z "$HOTKEY" ]; then
+    echo "Error: HOTKEY must be set before starting the miner"
+    exit 1
+fi
+
+if [ ! -f "$MODEL_PATH" ]; then
+    echo "Error: model artifact not found at $MODEL_PATH"
+    echo "Set POKER44_MODEL_PATH or copy models/poker44_xgb_calibrated.joblib into this repo."
+    exit 1
+fi
+
+python - <<'PY'
+import importlib
+import sys
+
+missing = []
+for package in ("bittensor", "joblib", "sklearn"):
+    try:
+        importlib.import_module(package)
+    except Exception as exc:
+        missing.append(f"{package}: {exc}")
+
+if missing:
+    print("Error: miner runtime dependencies are missing:")
+    for item in missing:
+        print(f"  - {item}")
+    print("Activate miner_env and run: pip install -r requirements.txt && pip install -e .")
+    sys.exit(1)
+PY
 
 pm2 delete $PM2_NAME 2>/dev/null || true
 
@@ -33,6 +75,10 @@ MINER_ARGS=(
   --axon.port "$AXON_PORT"
   --logging.debug
 )
+
+if [ -n "$CHAIN_ENDPOINT" ]; then
+  MINER_ARGS+=(--subtensor.chain_endpoint "$CHAIN_ENDPOINT")
+fi
 
 if [ -n "$ALLOWED_VALIDATOR_HOTKEYS" ]; then
   read -r -a VALIDATOR_HOTKEY_ARRAY <<< "$ALLOWED_VALIDATOR_HOTKEYS"
@@ -50,6 +96,9 @@ pm2 save
 echo "Miner started: $PM2_NAME"
 echo "View logs: pm2 logs $PM2_NAME"
 echo "Config: netuid=$NETUID network=$NETWORK wallet=$WALLET_NAME hotkey=$HOTKEY axon_port=$AXON_PORT"
+if [ -n "$CHAIN_ENDPOINT" ]; then
+    echo "Chain endpoint override: $CHAIN_ENDPOINT"
+fi
 if [ -n "$ALLOWED_VALIDATOR_HOTKEYS" ]; then
     echo "Access mode: validator allowlist"
 else
