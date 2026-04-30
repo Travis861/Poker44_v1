@@ -12,6 +12,16 @@ AGGRESSIVE_ACTIONS = ("bet", "raise")
 PASSIVE_ACTIONS = ("call", "check")
 POSITION_NAMES = ("button", "small_blind", "big_blind", "early", "middle", "late", "unknown")
 POSTFLOP_STREETS = ("flop", "turn", "river")
+TIMING_KEYS = (
+    "elapsed_ms",
+    "decision_ms",
+    "time_ms",
+    "action_ms",
+    "duration_ms",
+    "response_ms",
+    "seconds_to_act",
+    "time_to_act",
+)
 
 
 def safe_div(a: float, b: float) -> float:
@@ -45,6 +55,38 @@ def summarize(values: list[float], prefix: str) -> dict[str, float]:
         f"{prefix}_min": float(min(values)),
         f"{prefix}_max": float(max(values)),
     }
+
+
+def coefficient_of_variation(values: list[float]) -> float:
+    positives = [float(value) for value in values if float(value) > 0.0]
+    if not positives:
+        return 0.0
+    mean = float(statistics.fmean(positives))
+    return safe_div(float(statistics.pstdev(positives)) if len(positives) > 1 else 0.0, mean)
+
+
+def _linear_slope(values: list[float]) -> float:
+    if len(values) <= 1:
+        return 0.0
+    n = len(values)
+    x_mean = (n - 1) / 2.0
+    y_mean = float(statistics.fmean(values))
+    numerator = sum((idx - x_mean) * (value - y_mean) for idx, value in enumerate(values))
+    denominator = sum((idx - x_mean) ** 2 for idx in range(n))
+    return safe_div(numerator, denominator)
+
+
+def _safe_correlation(a: list[float], b: list[float]) -> float:
+    if len(a) != len(b) or len(a) <= 1:
+        return 0.0
+    mean_a = float(statistics.fmean(a))
+    mean_b = float(statistics.fmean(b))
+    var_a = sum((value - mean_a) ** 2 for value in a)
+    var_b = sum((value - mean_b) ** 2 for value in b)
+    if var_a <= 0.0 or var_b <= 0.0:
+        return 0.0
+    cov = sum((x - mean_a) * (y - mean_b) for x, y in zip(a, b))
+    return safe_div(cov, math.sqrt(var_a * var_b))
 
 
 def _action_counts(actions: list[dict[str, Any]]) -> Counter[str]:
@@ -149,6 +191,152 @@ def _action_transition_entropy(action_types: list[str]) -> float:
     return _normalized_entropy(list(transitions.values()))
 
 
+def _action_timing_value(action: dict[str, Any]) -> float | None:
+    for key in TIMING_KEYS:
+        if key not in action:
+            continue
+        value = safe_float(action.get(key), default=-1.0)
+        if value < 0.0:
+            continue
+        if key.endswith("_ms") or key in {"elapsed_ms", "decision_ms", "time_ms", "action_ms", "duration_ms", "response_ms"}:
+            value = value / 1000.0
+        return value
+    return None
+
+
+def _timing_micro_features(actions: list[dict[str, Any]]) -> dict[str, float]:
+    timings: list[float] = []
+    pot_before: list[float] = []
+    amount_sizes: list[float] = []
+    street_depths: list[float] = []
+    for action in actions:
+        timing = _action_timing_value(action)
+        if timing is None:
+            continue
+        timings.append(timing)
+        pot_before.append(safe_float(action.get("pot_before")))
+        amount_sizes.append(safe_float(action.get("normalized_amount_bb")))
+        street = (action.get("street") or "").lower()
+        street_depths.append({"preflop": 1.0, "flop": 2.0, "turn": 3.0, "river": 4.0}.get(street, 0.0))
+
+    if not timings:
+        return {
+            "timing_available": 0.0,
+            "decision_time_mean": 0.0,
+            "decision_time_std": 0.0,
+            "decision_time_cv": 0.0,
+            "decision_time_min": 0.0,
+            "decision_time_max": 0.0,
+            "fast_action_ratio": 0.0,
+            "slow_action_ratio": 0.0,
+            "timing_entropy": 0.0,
+            "timing_slope": 0.0,
+            "timing_pot_correlation": 0.0,
+            "timing_bet_size_correlation": 0.0,
+            "timing_street_correlation": 0.0,
+        }
+
+    fast_threshold = 1.5
+    slow_threshold = 8.0
+    buckets = Counter(min(10, int(value // 1.5)) for value in timings)
+    summary = summarize(timings, "decision_time")
+    return {
+        "timing_available": 1.0,
+        "decision_time_mean": summary["decision_time_mean"],
+        "decision_time_std": summary["decision_time_std"],
+        "decision_time_cv": coefficient_of_variation(timings),
+        "decision_time_min": summary["decision_time_min"],
+        "decision_time_max": summary["decision_time_max"],
+        "fast_action_ratio": safe_div(sum(1 for value in timings if value <= fast_threshold), len(timings)),
+        "slow_action_ratio": safe_div(sum(1 for value in timings if value >= slow_threshold), len(timings)),
+        "timing_entropy": _normalized_entropy(list(buckets.values())),
+        "timing_slope": _linear_slope(timings),
+        "timing_pot_correlation": _safe_correlation(timings, pot_before),
+        "timing_bet_size_correlation": _safe_correlation(timings, amount_sizes),
+        "timing_street_correlation": _safe_correlation(timings, street_depths),
+    }
+
+
+def _decision_optimality_features(actions: list[dict[str, Any]], hero_position: str) -> dict[str, float]:
+    decisions = [
+        action
+        for action in actions
+        if (action.get("action_type") or "").lower() in MEANINGFUL_ACTIONS
+    ]
+    if not decisions:
+        return {
+            "pot_odds_call_pressure_mean": 0.0,
+            "fold_under_good_odds_ratio": 0.0,
+            "call_under_bad_odds_ratio": 0.0,
+            "oversized_bet_ratio": 0.0,
+            "thin_bet_ratio": 0.0,
+            "position_adjusted_aggression": 0.0,
+            "street_adjusted_aggression": 0.0,
+            "passive_when_checked_to_ratio": 0.0,
+        }
+
+    pot_odds: list[float] = []
+    good_odds_folds = 0
+    bad_odds_calls = 0
+    oversized_bets = 0
+    thin_bets = 0
+    checked_to_passive = 0
+    aggressive_weighted = 0.0
+    street_weighted = 0.0
+    position_weight = {
+        "button": 1.20,
+        "late": 1.15,
+        "middle": 1.00,
+        "early": 0.85,
+        "small_blind": 0.80,
+        "big_blind": 0.90,
+        "unknown": 1.00,
+    }.get(hero_position, 1.0)
+
+    for action in decisions:
+        action_type = (action.get("action_type") or "").lower()
+        pot_before_bb = safe_float(action.get("pot_before"))
+        amount_bb = safe_float(action.get("normalized_amount_bb"))
+        call_to_bb = safe_float(action.get("call_to"))
+        raise_to_bb = safe_float(action.get("raise_to"))
+        required_call = call_to_bb if call_to_bb > 0.0 else amount_bb
+        odds = safe_div(required_call, pot_before_bb + required_call)
+        if required_call > 0.0:
+            pot_odds.append(odds)
+            if action_type == "fold" and odds <= 0.18:
+                good_odds_folds += 1
+            if action_type == "call" and odds >= 0.38:
+                bad_odds_calls += 1
+
+        bet_fraction = safe_div(max(amount_bb, raise_to_bb), pot_before_bb if pot_before_bb > 0.0 else 1.0)
+        if action_type in AGGRESSIVE_ACTIONS:
+            if bet_fraction >= 1.25:
+                oversized_bets += 1
+            if 0.0 < bet_fraction <= 0.20:
+                thin_bets += 1
+            aggressive_weighted += position_weight
+
+        street = (action.get("street") or "").lower()
+        street_weight = {"preflop": 0.85, "flop": 1.00, "turn": 1.10, "river": 1.20}.get(street, 1.0)
+        if action_type in AGGRESSIVE_ACTIONS:
+            street_weighted += street_weight
+        if action_type in PASSIVE_ACTIONS and pot_before_bb <= 0.0:
+            checked_to_passive += 1
+
+    n = len(decisions)
+    aggressive_count = sum(1 for action in decisions if (action.get("action_type") or "").lower() in AGGRESSIVE_ACTIONS)
+    return {
+        "pot_odds_call_pressure_mean": float(statistics.fmean(pot_odds)) if pot_odds else 0.0,
+        "fold_under_good_odds_ratio": safe_div(good_odds_folds, n),
+        "call_under_bad_odds_ratio": safe_div(bad_odds_calls, n),
+        "oversized_bet_ratio": safe_div(oversized_bets, max(aggressive_count, 1)),
+        "thin_bet_ratio": safe_div(thin_bets, max(aggressive_count, 1)),
+        "position_adjusted_aggression": safe_div(aggressive_weighted, n),
+        "street_adjusted_aggression": safe_div(street_weighted, n),
+        "passive_when_checked_to_ratio": safe_div(checked_to_passive, n),
+    }
+
+
 def hand_features(hand: dict[str, Any]) -> dict[str, float]:
     actions = hand.get("actions") or []
     players = hand.get("players") or []
@@ -196,6 +384,8 @@ def hand_features(hand: dict[str, Any]) -> dict[str, float]:
     bb_size = safe_float(metadata.get("bb"), 1.0) or 1.0
     hero_position = _position_name(hero_seat, button_seat, len(players))
     hero_profile = _seat_action_profile(actions, hero_seat)
+    timing_profile = _timing_micro_features(actions)
+    optimality_profile = _decision_optimality_features(actions, hero_position)
 
     final_pot = safe_float(outcome.get("total_pot")) or (max(pot_after_values) if pot_after_values else 0.0)
     final_pot_bb = safe_div(final_pot, bb_size)
@@ -293,6 +483,8 @@ def hand_features(hand: dict[str, Any]) -> dict[str, float]:
         "hero_position_known": 1.0 if hero_position != "unknown" else 0.0,
     }
     feats.update(hero_profile)
+    feats.update(timing_profile)
+    feats.update(optimality_profile)
     return feats
 
 
@@ -303,7 +495,7 @@ def chunk_features(chunk: list[dict[str, Any]]) -> dict[str, float]:
     per_hand = [hand_features(hand) for hand in chunk]
     feature_names = sorted(per_hand[0].keys())
 
-    out = {"chunk_size": float(len(chunk))}
+    out = {"chunk_size": float(len(chunk)), "hand_count": float(len(chunk))}
     for name in feature_names:
         values = [row[name] for row in per_hand]
         out.update(summarize(values, name))
@@ -314,6 +506,20 @@ def chunk_features(chunk: list[dict[str, Any]]) -> dict[str, float]:
     fold_vals = [row["fold_to_action_tendency"] for row in per_hand]
     stack_vals = [row["avg_starting_stack_bb"] for row in per_hand]
     pot_vals = [row["final_pot_bb"] for row in per_hand]
+    aggression_vals = [row["aggression_ratio"] for row in per_hand]
+    action_entropy_vals = [row["action_entropy"] for row in per_hand]
+    bet_cv_vals = [
+        safe_div(row["bet_size_std_bb"], row["avg_bet_size_bb"] if row["avg_bet_size_bb"] > 0 else 1.0)
+        for row in per_hand
+    ]
+    decision_time_vals = [row["decision_time_mean"] for row in per_hand if row["timing_available"] > 0.0]
+    fast_action_vals = [row["fast_action_ratio"] for row in per_hand]
+    slow_action_vals = [row["slow_action_ratio"] for row in per_hand]
+    pot_odds_vals = [row["pot_odds_call_pressure_mean"] for row in per_hand]
+    fold_good_odds_vals = [row["fold_under_good_odds_ratio"] for row in per_hand]
+    call_bad_odds_vals = [row["call_under_bad_odds_ratio"] for row in per_hand]
+    position_aggr_vals = [row["position_adjusted_aggression"] for row in per_hand]
+    street_aggr_vals = [row["street_adjusted_aggression"] for row in per_hand]
 
     out["consistency_score"] = safe_div(
         1.0,
@@ -322,6 +528,22 @@ def chunk_features(chunk: list[dict[str, Any]]) -> dict[str, float]:
         + (statistics.pstdev(aggr_vals) if len(aggr_vals) > 1 else 0.0)
         + (statistics.pstdev(raise_vals) if len(raise_vals) > 1 else 0.0),
     )
+    out["behavioral_consistency_score"] = safe_div(
+        1.0,
+        1.0
+        + coefficient_of_variation(vpip_vals)
+        + coefficient_of_variation(aggression_vals)
+        + coefficient_of_variation(raise_vals)
+        + coefficient_of_variation(bet_cv_vals)
+        + coefficient_of_variation(action_entropy_vals),
+    )
+    out["vpip_consistency_cv"] = coefficient_of_variation(vpip_vals)
+    out["aggression_consistency_cv"] = coefficient_of_variation(aggression_vals)
+    out["raise_frequency_consistency_cv"] = coefficient_of_variation(raise_vals)
+    out["bet_sizing_consistency_cv"] = coefficient_of_variation(bet_cv_vals)
+    out["action_entropy_consistency_cv"] = coefficient_of_variation(action_entropy_vals)
+    out["behavioral_pattern_slope_vpip"] = _linear_slope(vpip_vals)
+    out["behavioral_pattern_slope_aggression"] = _linear_slope(aggression_vals)
     out["vpip_aggr_gap_mean"] = float(statistics.fmean(v - a for v, a in zip(vpip_vals, aggr_vals)))
     out["fold_raise_gap_mean"] = float(statistics.fmean(f - r for f, r in zip(fold_vals, raise_vals)))
     out["showdown_rate"] = float(statistics.fmean(row["showdown"] for row in per_hand))
@@ -340,6 +562,38 @@ def chunk_features(chunk: list[dict[str, Any]]) -> dict[str, float]:
             safe_div(row["bet_size_std_bb"], row["avg_bet_size_bb"] if row["avg_bet_size_bb"] > 0 else 1.0)
             for row in per_hand
         )
+    )
+    out["timing_available_rate"] = safe_div(len(decision_time_vals), len(per_hand))
+    out["decision_time_chunk_mean"] = float(statistics.fmean(decision_time_vals)) if decision_time_vals else 0.0
+    out["decision_time_chunk_cv"] = coefficient_of_variation(decision_time_vals)
+    out["fast_action_rate_mean"] = float(statistics.fmean(fast_action_vals))
+    out["slow_action_rate_mean"] = float(statistics.fmean(slow_action_vals))
+    out["timing_regularity_score"] = safe_div(
+        1.0,
+        1.0 + out["decision_time_chunk_cv"] + coefficient_of_variation(fast_action_vals),
+    )
+    out["timing_to_aggression_correlation"] = _safe_correlation(
+        [row["decision_time_mean"] for row in per_hand],
+        aggression_vals,
+    )
+    out["timing_to_pot_odds_correlation"] = _safe_correlation(
+        [row["decision_time_mean"] for row in per_hand],
+        pot_odds_vals,
+    )
+    out["decision_optimality_score"] = safe_div(
+        1.0,
+        1.0
+        + float(statistics.fmean(fold_good_odds_vals))
+        + float(statistics.fmean(call_bad_odds_vals))
+        + abs(float(statistics.fmean(position_aggr_vals)) - float(statistics.fmean(street_aggr_vals))),
+    )
+    out["pot_odds_pressure_mean"] = float(statistics.fmean(pot_odds_vals))
+    out["fold_good_odds_rate_mean"] = float(statistics.fmean(fold_good_odds_vals))
+    out["call_bad_odds_rate_mean"] = float(statistics.fmean(call_bad_odds_vals))
+    out["position_aggression_alignment_mean"] = float(statistics.fmean(position_aggr_vals))
+    out["street_aggression_alignment_mean"] = float(statistics.fmean(street_aggr_vals))
+    out["position_street_aggression_gap"] = abs(
+        out["position_aggression_alignment_mean"] - out["street_aggression_alignment_mean"]
     )
     out["donk_bet_rate_mean"] = float(statistics.fmean(row["donk_bet_rate"] for row in per_hand))
     out["limp_rate"] = float(statistics.fmean(row["limp_flag"] for row in per_hand))
