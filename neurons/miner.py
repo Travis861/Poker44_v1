@@ -126,17 +126,38 @@ class Miner(BaseMinerNeuron):
         }
         return [chunk[index] for index in sorted(indices)]
 
+    def _log_validator_query_received(
+        self,
+        *,
+        caller: str,
+        chunk_sizes: list[int],
+        eval_chunk_sizes: list[int],
+    ) -> None:
+        chunk_count = len(chunk_sizes)
+        chunk_size_range = [min(chunk_sizes), max(chunk_sizes)] if chunk_sizes else [0, 0]
+        eval_chunk_size_range = (
+            [min(eval_chunk_sizes), max(eval_chunk_sizes)] if eval_chunk_sizes else [0, 0]
+        )
+        message = (
+            "Validator query received | "
+            f"caller={caller} "
+            f"chunk_count={chunk_count} "
+            f"chunk_size_range={chunk_size_range} "
+            f"eval_chunk_size_range={eval_chunk_size_range}"
+        )
+        bt.logging.info(message)
+        print(f"PM2_VALIDATOR_QUERY_RECEIVED {message}", flush=True)
+
     async def forward(self, synapse: DetectionSynapse) -> DetectionSynapse:
         chunks = list(synapse.chunks or [])
         caller = getattr(getattr(synapse, "dendrite", None), "hotkey", "unknown")
         chunk_sizes = [len(chunk or []) for chunk in chunks]
         eval_chunks = [self._compress_chunk(list(chunk or [])) for chunk in chunks]
         eval_chunk_sizes = [len(chunk) for chunk in eval_chunks]
-        bt.logging.info(
-            f"Received validator query | caller={caller} "
-            f"chunk_count={len(chunks)} "
-            f"chunk_size_range={[min(chunk_sizes), max(chunk_sizes)] if chunk_sizes else [0, 0]} "
-            f"eval_chunk_size_range={[min(eval_chunk_sizes), max(eval_chunk_sizes)] if eval_chunk_sizes else [0, 0]}"
+        self._log_validator_query_received(
+            caller=caller,
+            chunk_sizes=chunk_sizes,
+            eval_chunk_sizes=eval_chunk_sizes,
         )
         started = time.perf_counter()
         try:
